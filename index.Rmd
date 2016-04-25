@@ -32,6 +32,7 @@ library(ggplot2)
 library(rattle)
 library(e1071)
 library(reshape2)
+library(doParallel)
 # setwd("./machine_learning")
 opts_chunk$set(echo=FALSE, results='hide', cache=TRUE, message=FALSE, warning=FALSE)
 ```
@@ -112,7 +113,7 @@ A check for missing values reveals that certain variables are nearly completely 
 
 ## Predictive modeling
 
-```{r}
+```{r echo=TRUE}
 set.seed(65234)
 inTrain = createDataPartition(dataClean$class, p = 0.7)[[1]]
 training = dataClean[inTrain,]
@@ -191,10 +192,27 @@ Random Forests are one of the most popular and most successful classification al
 
 Random Forests usually do not require pre-processing of the data so we choose to use the unscaled and uncentered version of the dataset for training the model. The parameters that are usually explored during model tuning are *mtry*, the number of variables randomly sampled at each split and *ntree*, the number of trees to grow. Random Forest package included in the caret library in R has the default settings of *ntree*=500 and mtry set to the square root of the number of predictors, in our case *mtry*=`r floor(sqrt(ncol(trainX)))`. We use out of bag resampling method for assessing the out-of-sample error rate.
 
+```{r seeding}
+set.seed(123)
+#length is = (n_repeats*nresampling) + 1
+seeds <- vector(mode = "list", length = 11)
 
-```{r rf model}
-rfMod <- train(class ~., data=training, method="rf", trControl=trainControl(method="oob"),
+# 3 is the number of tuning parameter, mtry for rf
+for(i in 1:10) seeds[[i]] <- sample.int(n=1000, floor(sqrt(ncol(trainX)))) 
+seeds[[11]]<-sample.int(1000, 1) # for the last model
+```
+
+The seeds are pre-defined to enable reproducible parallel processing.
+
+```{r rf model, echo=TRUE}
+# control list
+myCtrl <- trainControl(method='oob', seeds=seeds)
+# run model in parallel
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+rfMod <- train(class ~., data=training, method="rf", trControl=myCtrl,
                allowParallel=TRUE, prox=TRUE)
+stopCluster(cl)
 ```
 
 The final model achieves accuracy of `r rfMod$results$Accuracy[1]` and Kappa coefficient of `r rfMod$results$Kappa[1]`. The final value of mtry used for the model was `r rfMod$bestTune$mtry`.
@@ -240,6 +258,17 @@ cm
 
 It is clear from the output above that the model is impressively accurate at predicting new data (Accuracy of `r cm$overall['Accuracy']`) and distinguishing between all five types of movement quality.
 
+
+### Test cases
+
+```{r results='markup'}
+quizData <- read.csv("pml-testing.csv")
+quizClean <- quizData[,goodCols]
+predQuiz <- predict(rfMod, quizClean)
+predProbs <- predict(rfMod, quizClean, type = "prob")
+print(predQuiz)
+# predProbs
+```
 
 <br>
 
