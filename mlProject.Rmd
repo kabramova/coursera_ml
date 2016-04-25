@@ -1,0 +1,277 @@
+---
+output: html_document
+---
+
+# Predicting movement quality with Random Forest
+
+## Introduction
+
+Human Activity Recognition (HAR) has emerged as an important research area in the recent years, both among professional and amateur research communities. HAR systems rely on recording large amounts of movement data via body-based or instrument-based sensors, or remote sensing using motion tracking technology and analyzing this data with the aim of discovering patterns in movement. The application of such analyses range from curiosity-driven behavior quantification to using the data to monitor one's sports performance.
+
+Until recently the majority of HAR analyses focused on quantifying what type of activity is being performed (e.g. cycling vs running) and how much of it. However, an equally important question is how well such an activity is performed, e.g. whether weights are being lifted properly. An ability to quantify this aspect could have important application to training programs such as when performance is being self-monitored or when it is difficult for the trainer to assess how the movement was performed, e.g. in horse riding cases.
+
+In this project we will use data collected for the Weight Lifting Exercise project (Velloso et al., 2013), in which 6 participants were asked to perform dumbbell lifts correctly and incorrectly in 5 different ways.
+Sensor readings were collected from devices attached to the belt, forearm, arm and dumbbell. Our goal in this project is to predict the manner in which participants performed the exercise.
+
+
+#### Further reading
+
+More information on the project and the dataset is available from the website [here](http://groupware.les.inf.puc-rio.br/har), see the section on the Weight Lifting Exercise Dataset.
+
+Velloso, E., Bulling, A., Gellersen, H., Ugulino, W., Fuks, H. (2013). Qualitative activity recognition of weight lifting exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI.
+
+
+<br>
+
+## Data
+
+``` {r message=FALSE, echo=FALSE}
+library(knitr)
+library(caret)
+library(ggplot2)
+library(rattle)
+library(e1071)
+library(reshape2)
+# setwd("./machine_learning")
+opts_chunk$set(echo=FALSE, results='hide', cache=TRUE, message=FALSE, warning=FALSE)
+```
+
+The training data for this project are available [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and the test data [here](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).
+
+
+
+### Data collection and raw data
+
+Six male healthy participants, aged 20-28 years, were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl (dumbbell weight 1,25kg) in five different fashions: 
+
+- exactly according to the specification (Class A)
+- throwing the elbows to the front (Class B)
+- lifting the dumbbell only halfway (Class C)
+- lowering the dumbbell only halfway (Class D)
+- throwing the hips to the front (Class E)
+
+For data recording four 9 degrees of freedom Razor inertial measurement units (IMU) were used, which provide three-axes acceleration, gyroscope and magnetometer data at a joint sampling rate of 45 Hz. The sensors were mounted on the user's glove, armband, lumbar belt and dumbbell.
+
+``` {r}
+dataRaw <- read.csv("pml-training.csv")
+names(dataRaw)
+```
+
+The raw sensor data contains 19622 observations on 160 variables, which consist of the following:
+
+- 1 outcome variable (classe): movement type
+- 1 row id variable (X)
+- 1 user id variable (user_name): the participant name
+- 3 timestamp variables for the recording
+- 2 variables that characterize the sliding window that was used for feature extraction (raw sensor data was pre-processed using a sliding window approach)
+- 12 variables (e.g. "roll_belt") for 3 Euler angles (roll, pitch and yaw) for the 4 sensors
+- 36 variables (e.g. "accel_belt_x") for raw accelerometer, gyroscope and magnetometer readings in 3 axes for the 4 sensors
+- 96 variables (e.g. "skewness_roll_belt") of 8 summary features for the Euler angles of the four sensors: mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness 
+- 8 variables (e.g. "total_accel_belt") of 2 summary features for acceleration of the 4 sensors: total acceleration and variance
+
+
+
+### Data pre-processing
+
+```{r}
+movClass <- dataRaw$classe
+userCols <- dataRaw[,1:7]
+predictorsRaw <- dataRaw[,8:159]
+
+str(predictorsRaw)
+
+unfactorize <- names(predictorsRaw)[sapply(predictorsRaw, class) == "factor"]
+predictorsNumeric <- predictorsRaw
+predictorsNumeric[,unfactorize] <- lapply(unfactorize, function(x) as.numeric(as.character(predictorsRaw[,x])))
+```
+
+We a priori exclude several variables from further analysis. Since we are interested in movement identification in general and not individual differences, we exclude the variable that contains participant name. We also exclude data associated with time-stamp and window because there is not enough data in the dataset to examine time-varying features of the movement (we do not have access to raw sensor data, which would be required to investigate this question).
+
+Next we perform some basic cleaning steps. A quick look at the type of variables in the dataset reveals that all except the outcome variable are continuous predictors. We change the column type to numeric for the columns that were mis-classified as factor variables.
+
+```{r}
+na_count <- sapply(predictorsNumeric, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+
+cutoff <- dim(predictorsNumeric)[1] * 0.9
+na_count$col <- rownames(na_count)
+goodCols <- na_count$col[na_count$na_count < cutoff]
+
+dataClean <- predictorsNumeric[,goodCols]
+dataClean$class <- movClass
+```
+
+A check for missing values reveals that certain variables are nearly completely empty. Therefore we define a cut-off point of the 90% of the number of observations. If a column contains more missing variables than the cut-off point, we exclude it from further analysis. This pre-processing step results in the final dataset containing 1 outcome variable and 52 continuous predictor variables:
+
+- 12 variables for 3 Euler angles (roll, pitch and yaw) for the 4 sensors
+- 4 variables for total acceleration of the 4 sensors
+- 36 variables for raw accelerometer, gyroscope and magnetometer readings in 3 axes for the 4 sensors
+
+
+<br>
+
+## Predictive modeling
+
+```{r}
+set.seed(65234)
+inTrain = createDataPartition(dataClean$class, p = 0.7)[[1]]
+training = dataClean[inTrain,]
+testing = dataClean[-inTrain,]
+```
+
+We split the clean data into training and test set with 70% of cases in the training set (N=`r dim(training)[1]`). 
+
+### Exploratory data analysis
+
+```{r}
+nzv <- nearZeroVar(training, saveMetrics=TRUE)
+
+trainX <- training[,names(training) != "class"]
+trainY <- training$class
+
+sk <- data.frame(value=sapply(trainX, skewness))
+sk$varName <- rownames(sk)
+# plot(sk$value)
+
+skewedVars <- sk$varName[sk$value > 5]
+# ggplot(trainX, aes(gyros_dumbbell_z)) + geom_histogram(binwidth=0.5) + xlim(c(-5,5))
+# log10(trainX$gyros_dumbbell_y + (1 - min(trainX$gyros_dumbbell_y)))
+```
+
+We perform some exploratory analysis on the training set. Checking for near zero variance predictors reveals that there are no such variables in the data. We also do not detect any skewed variables.
+
+```{r}
+preProc <- preProcess(trainX, method = c("center", "scale"))
+scaledTrain <- predict(preProc, trainX)
+scaledTrain$class <- trainY
+
+beltCols <- grep('_belt',names(training))
+armCols <- grep('_arm',names(training))
+dumbCols <- grep('_dumbbell',names(training))
+foreCols <- grep('_forearm',names(training))
+
+# featurePlot(x=training[,beltCols], y=training$class, "box")
+# featurePlot(x=training[,armCols], y=training$class, "box")
+# featurePlot(x=training[,dumbCols], y=training$class, "box")
+# featurePlot(x=training[,foreCols], y=training$class, "box")
+
+# featurePlot(x=scaledTrain[,beltCols], y=scaledTrain$class, "box")
+# featurePlot(x=scaledTrain[,armCols], y=scaledTrain$class, "box")
+# featurePlot(x=scaledTrain[,dumbCols], y=scaledTrain$class, "box")
+# featurePlot(x=scaledTrain[,foreCols], y=scaledTrain$class, "box")
+                        
+# for (col in training3[1:52]) {
+#     p <- ggplot(training3, aes(x=class, y=col)) + geom_boxplot()
+#     print(p)
+#     invisible(readline(prompt="Press [enter] to continue"))    
+# }
+```
+
+In order to view some exploratory feature plots for all the variables we first scale and center the data to visualize all the features on a comparable scale. The plots suggest that several variables seem promising for identification of some of the groups. In particular, belt data appears to distinguish between group A and the remaining groups (roll and acceleration), as well as between group E and the remaining groups (magnetometer readings). Arm readings on magnetometer and acceleration in X dimension seem to distinguish group A from the remaining groups. In the forearm readings, group C seems to differ from the remaining groups on roll and yaw. Finally, the dumbbell data appears to be dominated by outliers and little variation between groups so we suspect the dummbell features will not show up as important in classification. Some distinctive plots are shown in Figure 1.
+
+```{r Fig1}
+plotdf <- data.frame(scaledTrain$roll_belt, scaledTrain$magnet_belt_z, 
+                     scaledTrain$accel_arm_x, scaledTrain$yaw_forearm, scaledTrain$class)
+plotdf_long <- melt(plotdf)
+levels(plotdf_long$variable) <- c("belt.roll", "belt.magnet.Z", 
+                                  "arm.accel.X", "forearm.yaw")
+
+ggplot(plotdf_long, aes(x=scaledTrain.class, y=value)) + geom_boxplot() + 
+    facet_wrap(~variable) + xlab("Movement class") + ylab("Value in SDs") +
+    ggtitle("Fig.1: Exploratory plots")
+# ggplot(scaledTrain, aes(x=class, y=roll_belt)) + geom_boxplot() + geom_point()
+# ggplot(training3, aes(x=class, y=yaw_belt)) + geom_boxplot() + geom_point()
+# ggplot(training3, aes(x=yaw_belt, y=roll_belt, color=class)) + geom_point()
+```
+
+
+### The model
+
+Random Forests are one of the most popular and most successful classification algorithms used in a variety of contexts. At the same time, as typical for black-box algorithms, they are hard to interpret. Since the main goal of this project is predicting movement quality with the highest possible accuracy, rather than understanding what movement features are characteristic of different types of movement quality, we choose to primarily focus on predictive power and employ the Random Forest approach.
+
+Random Forests usually do not require pre-processing of the data so we choose to use the unscaled and uncentered version of the dataset for training the model. The parameters that are usually explored during model tuning are *mtry*, the number of variables randomly sampled at each split and *ntree*, the number of trees to grow. Random Forest package included in the caret library in R has the default settings of *ntree*=500 and mtry set to the square root of the number of predictors, in our case *mtry*=`r floor(sqrt(ncol(trainX)))`. We use out of bag resampling method for assessing the out-of-sample error rate.
+
+
+```{r rf model}
+rfMod <- train(class ~., data=training, method="rf", trControl=trainControl(method="oob"),
+               allowParallel=TRUE, prox=TRUE)
+```
+
+The final model achieves accuracy of `r rfMod$results$Accuracy[1]` and Kappa coefficient of `r rfMod$results$Kappa[1]`. The final value of mtry used for the model was `r rfMod$bestTune$mtry`.
+
+
+```{r results='markup'}
+# rfMod
+# rfMod$results
+# getTree(rfMod$finalModel, k=2)
+# ggplot(rfMod)
+# rfMod$finalModel
+importantVars <-varImp(rfMod)
+ggplot(importantVars) + ggtitle("Fig. 2: RF variable importance")
+```
+
+By plotting the most important variables for the model we can see that the most distinguishing variable is the belt roll and yaw, followed by dumbbell magnetometer readings.
+
+In order to get a glimpse of what a classificaiton tree for the problem we are considering could look like, we can also build a simple classification tree, using caret rpart option.
+
+```{r tree model}
+treeMod <- train(class ~., data=training, method="rpart")
+```
+
+```{r}
+fancyRpartPlot(treeMod$finalModel, sub="Fig. 3: Movement classification tree")
+```
+
+This model's accuracy is a lot smaller than the Random Forest model, namely `r treeMod$results$Accuracy[1]`. However, it appears that it considers similar variables to be of importance, e.g. the belt roll as reliably distinguishing between movement class E and the rest.
+
+
+### Cross-validation
+
+We assess the out-of-sample error rate of the Random Forest model on the held out testing set (N=`r dim(testing)[1]`).
+
+```{r results='markup'}
+predRF <- predict(rfMod, testing)
+predTree <- predict(treeMod, testing)
+
+cm <- confusionMatrix(predRF, testing$class)
+cm
+# confusionMatrix(predTree, testing$class)
+```
+
+It is clear from the output above that the model is impressively accurate at predicting new data (Accuracy of `r cm$overall['Accuracy']`) and distinguishing between all five types of movement quality.
+
+
+<br>
+
+## Conclusion
+
+In this project we achieve remarkable accuracy at distinguishing five types of movement quality using a Random Forest algorithm, in both training and test samples. Although interpretability of our results is somewhat limited our expoloratory analysis of the predictors and variables deemed important by the algorithm suggests that the belt roll, which has a clear bimodal distribution that differs across classes, could be an interesting variable to explore.
+
+```{r}
+ggplot(dataClean, aes(roll_belt, fill=class, colour=class)) + 
+    geom_density(alpha = 0.05) + xlab("Belt roll") + 
+    ggtitle("Fig. 4: Probability density of belt roll by movement class")
+```
+
+```{r}
+# alternative models
+# ldaMod <- train(class ~., data=scaledTrain, method="lda")
+# centering, scaling and transforming is important before pca
+# p <- prcomp(trainX)
+# percentVariance <- p$sd^2/sum(p$sd^2)*100
+# variable loadings:
+# head(p$rotation[,1:5])
+# 
+# trans <- preProcess(trainX, method=c("BoxCox", "center", "scale", "pca"))
+# transTrain <- predict(trans, trainX)
+# transTrain$class <- movClass
+# ldaMod2 <- train(class ~., data=transTrain, method="lda")
+```
+
+```{r}
+# predict.train has an argument type that can be used to get predicted class probabilities for different models
+# rfTestPred <- predict(rfMod, testing, type = "prob")
+# head(rfTestPred)
+# testing$RFprob <- rfTestPred[,"Class1"]
+# testing$RFclass <- predict(rfMod, testing)
+```
