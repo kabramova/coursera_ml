@@ -1,0 +1,7 @@
+/ml_assignments
+/index_cache
+/pics
+*.pdf
+pml-testing.csv
+pml-training.csv
+.Rproj.user
